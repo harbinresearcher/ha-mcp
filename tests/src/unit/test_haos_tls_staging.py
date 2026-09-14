@@ -153,6 +153,70 @@ def _patch_ws_connect(monkeypatch: Any, websocket: _FakeWebSocket) -> None:
     )
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_ws_connect_retries_until_core_accepts_the_handshake(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """After a Core restart HTTP answers before the WebSocket handshake does."""
+    clock = _FakeClock()
+    monkeypatch.setattr(haos_runtime, "time", clock)
+    websocket = _FakeWebSocket(None)
+    attempts: list[float] = []
+
+    def connect(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        attempts.append(kwargs["open_timeout"])
+        if len(attempts) < 3:
+            raise TimeoutError("timed out while waiting for handshake response")
+        return websocket
+
+    monkeypatch.setattr("websockets.sync.client.connect", connect)
+    caplog.set_level("DEBUG", logger=haos_runtime.LOG.name)
+
+    haos_runtime.promote_home_assistant_http_config(
+        "https://127.0.0.1:18123", "token", verify_ssl=False
+    )
+
+    assert clock.sleeps == [2.0, 2.0]
+    assert attempts == [30.0, 30.0, 30.0]
+    assert websocket.sent[-1] == {"id": 1, "type": "http/config/promote"}
+    assert caplog.text.count("not ready yet") == 2
+
+
+def test_ws_connect_retry_stops_at_the_command_timeout(monkeypatch: Any) -> None:
+    """A Core that never accepts the handshake fails within the caller's budget."""
+    clock = _FakeClock()
+    monkeypatch.setattr(haos_runtime, "time", clock)
+    attempts: list[float] = []
+
+    def connect(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        attempts.append(kwargs["open_timeout"])
+        clock.now += kwargs["open_timeout"]
+        raise TimeoutError("timed out while waiting for handshake response")
+
+    monkeypatch.setattr("websockets.sync.client.connect", connect)
+
+    with pytest.raises(TimeoutError):
+        haos_runtime.promote_home_assistant_http_config(
+            "https://127.0.0.1:18123", "token", timeout=100.0, verify_ssl=False
+        )
+
+    # Three full 30 s attempts with 2 s pauses, then only the 4 s still left.
+    assert attempts == [30.0, 30.0, 30.0, 4.0]
+    assert clock.now == 100.0
+
+
 def test_ws_command_requires_the_auth_required_handshake(monkeypatch: Any) -> None:
     """A socket that skips auth_required fails loudly instead of proceeding."""
     _patch_ws_connect(monkeypatch, _FakeWebSocket(None, frames=[{"type": "auth_ok"}]))

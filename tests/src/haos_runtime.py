@@ -1388,9 +1388,14 @@ def _connect_home_assistant_ws(
                 open_timeout=min(remaining, 30.0),
                 ssl=ssl_context,
             )
-        except (OSError, TimeoutError, websockets.exceptions.WebSocketException):
+        except (
+            OSError,
+            TimeoutError,
+            websockets.exceptions.WebSocketException,
+        ) as error:
             if time.monotonic() + 2.0 >= deadline:
                 raise
+            LOG.debug("Core WebSocket %s not ready yet: %r", ws_url, error)
             time.sleep(2.0)
 
 
